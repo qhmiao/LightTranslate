@@ -9,6 +9,8 @@ lexicon.idx
 dictionary-build.txt
 settings.json
 status.log
+deepl-key.bin
+deepl-key.bin.*.tmp
 self-test.json
 .vs/
 *.user

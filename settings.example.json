@@ -2,6 +2,7 @@
   "Enabled": true,
   "ClipboardFallback": true,
   "Target": "zh-Hans",
+  "TranslationProvider": "auto",
   "MaxSelectionLength": 2000,
   "ExcludedApps": [],
   "Diagnostics": false,

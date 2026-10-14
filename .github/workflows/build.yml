@@ -17,18 +17,37 @@ jobs:
       - name: Build application
         shell: pwsh
         run: ./build.ps1
+      - name: Clipboard workflow regression
+        shell: pwsh
+        run: ./scripts/test-clipboard.ps1
+      - name: Native window gesture boundaries
+        shell: pwsh
+        run: ./scripts/test-gestures.ps1
+      - name: Non-text selection contexts
+        shell: pwsh
+        run: ./scripts/test-selection-context.ps1
+      - name: Translation providers and DeepL offline regression
+        shell: pwsh
+        run: ./scripts/test-providers.ps1
+      - name: Isolated native clipboard regression
+        shell: pwsh
+        run: ./scripts/test-clipboard.ps1 -Native
       - name: Fetch and build pinned dictionary
         shell: pwsh
         run: ./scripts/download-dictionary.ps1
       - name: Run offline self-test
         shell: pwsh
         run: ./scripts/test.ps1
+      - name: Real selection helper integration
+        shell: pwsh
+        run: ./scripts/test-selection.ps1
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: LightTranslate-windows-x64
           path: |
             dist/LightTranslate/LightTranslate.exe
+            dist/LightTranslate/LightTranslate.SelectionHost.exe
             dist/LightTranslate/LightTranslate.exe.config
             dist/LightTranslate/LightTranslate.ico
             dist/LightTranslate/lexicon.dat

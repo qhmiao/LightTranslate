@@ -56,8 +56,9 @@ GitHub Actions 会执行编译、词库构建和离线自检，并上传构建�
 | 字段 | 默认值 | 作用 |
 |---|---|---|
 | `Enabled` | `true` | 自动划词翻译开关，也可通过托盘修改 |
-| `ClipboardFallback` | `true` | 剪贴板取词开关，关闭后停止取词 |
-| `Target` | `zh-Hans` | 微软接口的目标语言；本地词库和腾讯备用接口输出中文 |
+| `ClipboardFallback` | `true` | 选区取词开关，关闭后停止所有取词 |
+| `TranslationProvider` | `auto` | `auto` 保留本地词库优先、微软失败后腾讯；`microsoft` / `tencent` / `deepl` 仅调用选定服务并跳过词库 |
+| `Target` | `zh-Hans` | 微软 / DeepL 的目标语言；本地词库和腾讯输出中文 |
 | `MaxSelectionLength` | `2000` | 单次选区字符数上限 |
 | `ExcludedApps` | `[]` | 排除的进程名称，可带或不带 `.exe` |
 | `Diagnostics` | `false` | 触发诊断日志开关 |
@@ -72,10 +73,10 @@ GitHub Actions 会执行编译、词库构建和离线自检，并上传构建�
 补充平面的字母按 Unicode 标量计一次，全角 Latin / 重音字母计入分母但不计英文分子。
 大于 0% 时没有 A–Z/a–z 的文本不触发；0% 时无文字字母或纯中文仍被原有规则跳过。
 
-`ClipboardFallback` 沿用早期字段名，当前取词路径统一使用剪贴板。
+`ClipboardFallback` 沿用早期字段名，同时控制剪贴板取词和独立进程选区读取。
 
 面板纳入 `Enabled`、`ClipboardFallback`、`Target`、`MaxSelectionLength`、`ExcludedApps`
-和五项阅读选项。目标语言只校验修改后输入的语言标签语法，不联网获取语言列表；服务是否支持自定义标签由微软决定。
+和五项阅读选项。目标语言只校验修改后输入的语言标签语法，不联网获取语言列表；服务是否支持自定义标签由所选服务决定。
 修改后的选区上限要求正整数，排除应用支持换行及中英文逗号/分号，按进程名校验、去重。
 未改动的原有自定义目标、长度和排除数组逐值保留；隐藏的 `Diagnostics` 克隆保留，不因普通设置或恢复默认值而重置。
 
@@ -96,15 +97,16 @@ GitHub Actions 会执行编译、词库构建和离线自检，并上传构建�
 
 ## 取词与数据处理
 
-程序使用带内部标记的 `Ctrl+C` 获取选区，并尝试保存、恢复原剪贴板的各格式。
+程序先由独立进程判断文本上下文和读取 UIA 选区；空选区及非文本交互不访问剪贴板。仅确认是文本区域但缺少选区接口时，才使用带内部标记的 `Ctrl+C` 回退，快照仅接受支持的文本格式；原剪贴板无法完整安全备份时保留原内容并提示读取失败。
 如果用户或其他应用在取词期间更新了剪贴板，程序会避免覆盖新的内容。
 系统剪贴板历史和第三方剪贴板管理器仍可能保留临时复制记录。
 
-命中本地词库的选区不会发送给在线服务。其他文字发送给微软，主服务失败时可能发送给腾讯。
-启动时会预热微软连接，该请求不包含选区文字。在线接口采用兼容协议，当前无需个人 API 密钥；
-接口可用性由服务端决定，可能出现限流或协议变更。
+自动模式命中本地词库时不发送选区；未命中发送给微软，失败后可能发送给腾讯。
+自动或微软模式启动时预热微软连接，不包含选区；腾讯和 DeepL 模式不预热。
+明确选择单一服务时跳过词库且不回退；DeepL 需要用户保存密钥，可能计费。
+微软和腾讯内置接口无需个人密钥；接口可用性由服务端决定，可能限流或变更。
 
-译文缓存最多 256 条，仅保存在当前进程内。程序不记录选区原文或用户译文。
+普通服务和 DeepL 各有最多 256 条译文缓存，仅保存在当前进程内。程序不记录选区原文或用户译文。
 诊断日志启用后会记录进程名、进程编号、字符数和触发状态；启动错误日志可能包含本机路径。
 
 ## 兼容性记录
@@ -147,3 +149,208 @@ OCR、朗读、翻译历史、原位替换、AI 润色、自动更新、安装�
 13. 输入非法颜色、字号、秒数或比例，确认就地报错且不保存；取消和关闭设置不应用，重启后保留已保存的值且不改动自动翻译开关等其他设置。
 14. 打开面板后切换托盘自动翻译，再保存其他选项，确认开关不会被旧值覆盖；目标语言、选区上限、排除应用和取词开关即时应用，取消不应用。
 15. 自启验证只在隔离目录或模拟后端完成；打开、勾选、恢复配置默认值和取消均不得写入，只有保存才能修改；覆盖禁用/未知/异目标以及保存和回滚失败状态。真实用户启动项由用户自行选择，不作为自动测试动作。
+
+## Clipboard capture regression
+
+`./scripts/test-clipboard.ps1` tests capture cancellation, concurrent selections,
+snapshot/read/restore races and bounded retries without accessing the clipboard.
+`./scripts/test-clipboard.ps1 -Native` creates a private window station and desktop
+before opening a clipboard. It aborts if isolation is unavailable; it never falls
+back to the interactive clipboard. It tests exact byte preservation for Unicode,
+HTML and RTF, empty/unsupported/oversized data, busy access, stale restoration and
+delayed rendering. Both commands run in CI; neither needs the dictionary.
+
+Capture now accepts only HGLOBAL text formats (Unicode/ANSI/OEM text, locale,
+HTML Format and Rich Text Format), at most 64 formats, 8 MiB per format and
+16 MiB total. Unknown or incomplete snapshots bypass Ctrl+C and try the isolated selection helper;
+images, file lists and application-private formats are not silently discarded.
+Delayed rendering may cause a snapshot to be skipped when its version changes.
+A slow native clipboard owner can still delay GetClipboardData. Restore checks
+the sequence while holding OpenClipboard, and preallocates every buffer before
+EmptyClipboard. Windows provides no atomic multi-format replacement; a native
+SetClipboardData failure is reported, and newer user data is never deliberately
+replaced to retry a failed restore. Cancellation leaves the current clipboard
+alone. A copy from the same source with no observable input/version distinction
+cannot be attributed with certainty; this is not a proof of clipboard ownership.
+
+The change bypasses the observed IDataObject/OLE IStream conversion crash path.
+The original native crash has not been reproduced, and the faulty format or
+provider has not been identified. These tests exercise the replacement behavior,
+not the original corrupt COM pointer.
+
+## Tray icon rendering
+
+The offline self-test renders `tray-icon-preview.png` at 16/20/24/32/48/64 px
+with three font/background combinations. Glyph ink bounds are centered inside
+the solid circle. The selected reading font and automatic contrast foreground
+are reused; font size is fitted to the icon, independently of bubble text size.
+The test replaces an invisible NotifyIcon 100 times and checks USER handle growth.
+This does not replace a live Explorer tray/DPI test. Saved appearance settings
+update the running tray icon and dispose its previous Icon; canceled edits do not.
+
+## Translation provider regression
+
+`TranslationProvider` defaults to `auto` for old settings. The panel also offers
+`microsoft`, `tencent` and `deepl`; explicit choices bypass the local dictionary and never
+fall back to another service. Tencent currently outputs Chinese only. Its target
+control is disabled without erasing the last target. Automatic mode
+retains the existing Chinese dictionary and Tencent fallback behavior even when
+Microsoft's target is another language. DeepL is never part of automatic fallback.
+
+The offline self-test uses an injected HTTP handler to verify routing, automatic
+fallback, explicit-provider failure, provider/target cache separation, canceled
+in-flight responses, and settings save/cancel/reopen/live application. It makes
+no network requests. Applying settings uses the existing capture/request
+cancellation path before any new translation. Live service availability is not
+covered by these fixture tests.
+
+
+## Optional DeepL API
+
+DeepL uses only `POST https://api.deepl.com/v2/translate` or
+`POST https://api-free.deepl.com/v2/translate`, with `DeepL-Auth-Key` Authorization.
+The key suffix `:fx` selects the latter, following the official
+[authentication guide](https://developers.deepl.com/docs/getting-started/auth) and
+[SDK endpoint selection](https://github.com/DeepLcom/deepl-dotnet/blob/main/DeepL/Translator.cs).
+This does not infer a host from plan marketing names. DeepL says its API documentation
+applies to all plans. Its [current plans](https://support.deepl.com/hc/en-us/articles/360021200939-DeepL-API-plans)
+include Developer (a total, non-resetting allowance), Growth and Enterprise;
+legacy Free/Pro are no longer sold. The app does not promise a recurring free quota.
+Region-specific Enterprise endpoints are not included in this implementation.
+No custom URL, redirect, automatic retry or automatic switch to/from DeepL is allowed.
+`zh-Hans` and `zh-Hant` normalize to `ZH-HANS` and `ZH-HANT`.
+
+`deepl-key.bin` contains only current-user DPAPI ciphertext. It is excluded from Git
+and release artifacts. Plaintext is not serialized into settings, logs, error messages,
+previews or test reports. Opening settings checks only file existence and never fills
+the PasswordBox with a stored key. Replacement/clear is staged until Save; config-save
+failure attempts to restore the previous encrypted file. Rollback failure is reported.
+This is not a crash-atomic transaction across config, credentials and startup state.
+DPAPI protects storage from other users, not processes already running as that user;
+the key necessarily exists briefly in managed memory and the outgoing auth header.
+The controller cancels pending translations on settings application. The DeepL client
+also rejects a response if credentials changed during its request, checks credentials
+before cache access and clears its separate cache when the credential scope changes.
+
+Run `./scripts/test-providers.ps1` after building, or run the complete offline self-test.
+The provider test is also a separate CI step. Only fictitious sentinel credentials,
+injected HTTP handlers, a temporary DPAPI file and fake startup registration are used.
+Coverage includes zero requests without a key, default/explicit routing, both hosts,
+Chinese targets, provider/target/credential cache isolation, authentication failures,
+quota exhaustion, 429, invalid targets, request size, malformed responses, timeout,
+network failure, cancellation, stale responses, and save/clear/cancel/reopen/rollback.
+No live DeepL account, registration, key validation or billed request is exercised.
+The generated settings previews show an empty credential field.
+
+
+## 图片或专用格式剪贴板下的选区读取
+
+仅允许文本快照的守卫会拒绝图片和应用专用格式。这是保护原剪贴板所需的行为。
+现在首先通过短时独立进程 `LightTranslate.SelectionHost.exe` 判断上下文并请求应用的
+UIA TextPattern 选区；能直接读取的文本无需快照，也不读取或修改剪贴板。
+主程序仍不引用 UIAutomationClient，不持有跨进程 UIA/COM 对象，也不恢复原 OLE 快照路径。
+辅助进程只接受源窗口、焦点窗口句柄、鼠标起止位置、起点原生窗口和长度上限，验证窗口归属并拒绝密码字段；
+选区通过匿名标准输出管道返回，不写文件或日志。辅助进程有 3 秒的自身终止期限，
+主程序异步等待上限为 3.8 秒，并丢弃已取消或焦点改变后的响应。
+这不是权限沙箱；它隔离 UIA 原生故障，不会终止用户源应用或轻译主进程。
+已确认文本区域无法安全读取或超时，以及辅助程序缺失时，浮层提示取词失败并保留剪贴板；尚未确认文本上下文时只保留固定诊断码。
+
+`./scripts/test-selection.ps1` 使用真实 Windows 编辑控件和真实外部辅助进程，
+合成选区经过上下文判断、选区读取、英文比例检查，最终命中本地词典。
+它同时验证空选区、密码框、错误源窗口、取消和输出长度上限，不调用在线翻译，
+不读取用户剪贴板内容，也不改变用户窗口焦点；只记录剪贴板序列号是否保持不变。
+`./scripts/test-clipboard.ps1 -Native` 在私有 window station 中额外验证真实编辑控件的
+复制命令、原生快照恢复，以及专用格式不会被覆盖；所有数据均为合成数据。
+这些测试不等于已验证每个浏览器、Word、管理员权限窗口或远程桌面的实际兼容性。
+
+### Chromium 选区定位
+
+鼠标拖选网页文字不一定把键盘焦点移到该文档。辅助进程优先从鼠标释放位置的
+UIA 元素向上查找 TextPattern，随后才尝试原生焦点和 UIA 键盘焦点；每一步验证
+源窗口归属，最多查找 32 层，并保留独立进程的总超时限制。它不扫描其他文档、
+不读整个页面或 ValuePattern 的值（仅检查 IsReadOnly 元数据），也不修改 Chromium 的可访问性设置。
+主程序仅记录固定失败码，例如无 TextPattern、空选区、密码字段、窗口不符、
+深度上限、提供方异常和超时；不记录控件名称、选区原文或页面内容。
+真实控件测试不覆盖网页布局、iframe 与键盘焦点差异，仍须进行实际拖选验收。
+
+### 窗口操作与文字拖选的边界
+
+鼠标按下、松开时，输入线程只记录窗口句柄、客户区位置、窗口边界和控件类名。
+取词前排除非客户区、原生滚动条、跨窗口拖动，以及期间发生的窗口移动或缩放；
+客户区内的自绘标题栏再由带 25 毫秒时限的 WM_NCHITTEST 检查排除。
+命中测试在 UI 调度线程执行，不在全局鼠标钩子中发送跨进程消息。
+不合格的手势不会进入选区读取、剪贴板快照、复制或翻译路径，也不会成为下一次双击的起点。
+
+`./scripts/test-gestures.ps1` 使用自有隐藏原生窗口、编辑框和滚动条，结合合成手势端点，
+验证普通文字拖选、双击区域、标题栏、边框、独立滚动条、编辑框内滚动条、自绘标题栏、
+客户区发起的移动和缩放，以及移动之后重新选词。测试使用真实窗口几何和命中测试，
+不向用户应用注入鼠标事件，不读取剪贴板内容；它不替代实际记事本、浏览器和桌面应用验收。
+完全自绘、未暴露原生滚动条且命中测试始终返回客户区的滚动条仍不在此守卫的覆盖范围内。
+
+### 空选区与读取失败
+
+辅助进程的结果区分有文本、成功但选区为空、不支持 TextPattern、密码字段、超时与失败。
+成功的空选区直接结束当前取词，不显示失败提示；辅助进程也不再向其他焦点或祖先回退，
+避免把另一个控件保留的旧选区作为本次结果。折叠文本范围先检查端点，不读取其相邻文本。
+文本区域缺少选区接口、超时和提供方异常仍保留失败提示。未确认文本上下文的无接口、超时或异常仅记固定诊断，不将一般交互当作取词错误。
+
+选区集成测试使用真实 TextBox 和 RichTextBox，分别覆盖文末折叠选区（空拖动后的状态）、
+正文中折叠光标、空文档以及空选区前后的正常选词；经过同一上下文判断和错误转换路径，
+验证没有复制、剪贴板读取或旧文本返回。另验证真实不支持 TextPattern 的窗口和固定错误协议。
+这些控件测试不注入实际记事本鼠标动作；实际记事本的文末空拖以及 Chromium 正常选词仍需人工验收。
+
+### 非文本交互的提前判断
+
+`./scripts/test-selection-context.ps1` 使用自有隐藏 ListView、TreeView 和列表内编辑框，
+覆盖空白图标区域、已有项目选中的图标拖动上下文、详细列表和树选择；同时在可备份与
+不可备份的模拟剪贴板下验证快照、复制、读取和恢复调用次数均为零，且不返回旧文本。
+列表内的重命名编辑框仍能返回所选测试词；不是按 Explorer 进程名或桌面标题硬编码禁用。
+
+辅助进程按控件角色及 Selection/SelectionItem 模式识别项目交互，区分 Edit/Document
+文本区域；网页列表仍可向所属 Document 查找文本选区。Shell 的 UIA 层级若跳过原生
+根窗口，到达源窗口边界时保留已确认的非文本结果，不查询其他窗口或回退旧焦点。
+只有已确认的文本区域缺少文本选区接口时才允许剪贴板回退；未知区域安静结束，
+探测失败保留固定诊断码，已确认文本区域的读取失败仍提示，且不会盲目复制。
+辅助进程成为取词前置依赖，须与主程序一起分发。
+
+测试不移动用户图标或文件，也不执行真实 Shell 拖放。实际桌面另做只读控件分类验证；
+桌面框选、资源管理器列表交互及文件重命名的实际手势仍需人工验收。剪贴板序列号是
+只读观察项，其他程序在测试期间可能改变它；不接触剪贴板的断言以调用计数为准。
+
+### 未确认文本上下文的系统浮层交互
+
+窗口不提供 TextPattern 只能说明没有确认可读取的文本选区，不足以认定用户正在选词。
+因此通用 Pane/Group 等区域以及尚未确认文本上下文的探测失败会安静结束，仍记录固定
+`no-text-pattern`、`provider-error`、`deadline` 等诊断码；不启动剪贴板回退。鼠标所在区域
+已成功检查但没有文本证据时，不再转向另一个控件的旧键盘选区。
+
+辅助进程确认 Edit/Document 或取得 TextPattern 后，错误与超时分别使用
+`text-provider-error`、`text-deadline`，仍显示读取失败提示。文本框、网页文档和重命名
+编辑框无需按宿主进程豁免；没有通知中心、日历或系统进程的黑名单。
+
+上下文测试增加真实 Panel、GroupBox、Button、Label、MonthCalendar、TrackBar、
+CheckBox，以及通用面板内 TextBox 的选词，断言无文本区域既不报错也不读写剪贴板，
+已确认文本失败仍提示。它们覆盖通知、日历、快速设置常见控件语义，不等于自动操作
+或完整复现 Windows 系统浮层；没有清除通知、读取通知正文或更改系统设置。
+
+### 文件属性单元格与真正的重命名编辑框
+
+真实 Explorer 复现表明，文件列表的属性单元格可能暴露为 Edit + ValuePattern，却没有
+TextPattern；鼠标释放在这种单元格时，键盘焦点仍在 ListItem。仅凭 Edit 角色允许剪贴板
+回退会将文件拖动当成选词失败。现在会检查 Selection/SelectionItem 祖先、焦点和只读
+元数据：列表内未活动或只读的属性若没有 TextPattern，按项目交互结束，不发复制命令。
+提供 TextPattern 的重命名编辑框及只读可选文本仍可读取；活动的可编辑控件缺少该接口时
+仍可走原有安全回退，普通文本提供方异常与超时仍提示。不使用进程名或控件类名黑名单。
+
+鼠标手势还将按下时记录的原生窗口和位置传给辅助进程，在读取释放位置之前检查起点；
+起点没有文本证据时，不因终点碰到另一个编辑框或焦点改变而读取其旧选区。该检查不在
+鼠标钩子中运行，也不读取起点选中文字；按 Esc 取消的拖动不再排队取词。UIA 起点语义
+在释放后的隔离进程中检查，因此源界面在手势期间完全重建的情况仍需按实际应用验收。
+
+上下文测试增加真实隐藏控件的 MSAA Edit 属性角色、单选／多选列表、只读与未活动属性、
+列表内真正的编辑框和只读文本选区，并确认列表之外的无接口 Edit 不被全局屏蔽。
+另对同一真实 Explorer 的 12 个属性单元格比较旧、新辅助程序：旧版均返回
+text-unsupported，修复后均返回 non-text；比较不读取文件名、选区或剪贴板。
+该分类比较不替代完整交互验收。人工测试只在专用目录的合成文件上进行，分别检查单选
+及多选后横拖释放、框选、Esc 取消拖动、F2 后选取文件名文字并取消重命名；不拖动、
+移动或覆盖用户真实文件。当前候选的最终鼠标交互结果需在部署后单独记录。

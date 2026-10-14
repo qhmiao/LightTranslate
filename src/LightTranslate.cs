@@ -41,6 +41,13 @@ namespace LightTranslate
                     Lexicon.Build(args[1], Folder);
                     return 0;
                 }
+                if (args.Length > 0 && args[0] == "--self-test-clipboard") return ClipboardCaptureTests.RunStandalone();
+                if (args.Length > 0 && args[0] == "--self-test-clipboard-native") return ClipboardNativeTests.Run();
+                if (args.Length > 0 && args[0] == "--self-test-providers") return TranslationProviderTests.RunStandalone();
+                if (args.Length > 0 && args[0] == "--self-test-tray") return TrayIconRenderer.RunStandalone();
+                if (args.Length > 0 && args[0] == "--self-test-gestures") return SelectionGestureTests.Run();
+                if (args.Length > 0 && args[0] == "--self-test-selection-context") return SelectionContextTests.Run();
+                if (args.Length > 0 && args[0] == "--self-test-selection") return SelectionIntegrationTests.Run();
                 if (args.Length > 0 && args[0] == "--self-test") return SelfTest.Run(false);
                 if (args.Length > 0 && args[0] == "--self-test-offline") return SelfTest.Run(true);
                 bool created;
@@ -81,6 +88,7 @@ namespace LightTranslate
         public bool Enabled = true;
         public bool ClipboardFallback = true;
         public string Target = "zh-Hans";
+        public string TranslationProvider = "auto";
         public int MaxSelectionLength = 2000;
         public string[] ExcludedApps = new string[0];
         public bool Diagnostics = false;
@@ -107,6 +115,7 @@ namespace LightTranslate
         }
         internal void NormalizeReading()
         {
+            TranslationProvider = Translator.NormalizeProvider(TranslationProvider);
             BubbleFontFamily = BubbleAppearance.ResolveFont(BubbleFontFamily).Source;
             if (double.IsNaN(BubbleFontSize) || double.IsInfinity(BubbleFontSize) || BubbleFontSize < 10 || BubbleFontSize > 48) BubbleFontSize = 14;
             Color color;
@@ -125,7 +134,7 @@ namespace LightTranslate
         internal void CopyUserFrom(Settings other)
         {
             Enabled = other.Enabled; ClipboardFallback = other.ClipboardFallback;
-            Target = other.Target; MaxSelectionLength = other.MaxSelectionLength;
+            Target = other.Target; TranslationProvider = other.TranslationProvider; MaxSelectionLength = other.MaxSelectionLength;
             ExcludedApps = other.ExcludedApps == null ? null : (string[])other.ExcludedApps.Clone();
             CopyReadingFrom(other);
             if (Changed != null) Changed();
@@ -182,10 +191,10 @@ namespace LightTranslate
             settings = Settings.Load();
             lexicon = new Lexicon(Program.Folder);
             translator = new Translator();
-            var warming = translator.WarmConnection();
+            if (settings.TranslationProvider == "auto" || settings.TranslationProvider == "microsoft") { var warming = translator.WarmConnection(); }
             bubble = new Bubble();
             bubble.ApplySettings(settings);
-            tray = new Forms.NotifyIcon { Text = "轻译 · 选中即译", Icon = MakeIcon(), Visible = true };
+            tray = new Forms.NotifyIcon { Text = "轻译 · 选中即译", Icon = MakeIcon(settings), Visible = true };
             var menu = new Forms.ContextMenuStrip();
             enabledItem = new Forms.ToolStripMenuItem("自动划词翻译") { Checked = settings.Enabled, CheckOnClick = true };
             enabledItem.Click += delegate
@@ -210,7 +219,7 @@ namespace LightTranslate
             timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
             timer.Tick += delegate { CheckDismissal(); FlushDiagnostics(); };
             timer.Start();
-            Program.Log("started", "hooks=dedicated-thread recovery=enabled capture=clipboard dictionary=" + lexicon.Count);
+            Program.Log("started", "hooks=dedicated-thread recovery=enabled capture=isolated-context clipboard=text-fallback dictionary=" + lexicon.Count);
         }
 
         private void OpenSettings()
@@ -221,29 +230,17 @@ namespace LightTranslate
                 if (settingsWindow.WindowState == WindowState.Minimized) settingsWindow.WindowState = WindowState.Normal;
                 settingsWindow.Activate(); return;
             }
-            settingsWindow = new SettingsWindow(settings, delegate { enabledItem.Checked = settings.Enabled; Dismiss(true); bubble.ApplySettings(settings); });
+            settingsWindow = new SettingsWindow(settings, delegate { enabledItem.Checked = settings.Enabled; Dismiss(true); bubble.ApplySettings(settings); TrayIconRenderer.Update(tray, settings); });
             settingsWindow.Closed += delegate { settingsWindow = null; };
             settingsWindow.Show();
         }
 
-        internal static System.Drawing.Icon MakeIcon()
-        {
-            using (var bmp = new System.Drawing.Bitmap(32, 32))
-            using (var g = System.Drawing.Graphics.FromImage(bmp))
-            using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(56, 112, 210)))
-            using (var font = new System.Drawing.Font("Microsoft YaHei UI", 16, System.Drawing.FontStyle.Bold))
-            {
-                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                g.Clear(System.Drawing.Color.Transparent);
-                g.FillEllipse(brush, 1, 1, 30, 30);
-                g.DrawString("译", font, System.Drawing.Brushes.White, 1, 1);
-                IntPtr h = bmp.GetHicon();
-                try { return (System.Drawing.Icon)System.Drawing.Icon.FromHandle(h).Clone(); }
-                finally { Native.DestroyIcon(h); }
-            }
-        }
+        internal static System.Drawing.Icon MakeIcon(Settings value = null)
+        { return TrayIconRenderer.Create(value ?? new Settings()); }
 
-        private void HandleMouse(int message, Native.MOUSE data, IntPtr capturedWindow)
+        private SelectionSurface downSurface;
+
+        private void HandleMouse(int message, Native.MOUSE data, IntPtr capturedWindow, SelectionSurface surface)
         {
             if (!disposed)
             {
@@ -262,7 +259,8 @@ namespace LightTranslate
                             down = settings.Enabled;
                             dragged = false;
                             downPoint = data.pt;
-                            downWindow = Native.GetAncestor(Native.WindowFromPoint(data.pt), 2);
+                            downSurface = surface;
+                            downWindow = surface == null ? IntPtr.Zero : surface.Root;
                         }
                     }
                     else if (message == 0x200 && down)
@@ -273,18 +271,20 @@ namespace LightTranslate
                     {
                         mouseUps++;
                         down = false;
-                        bool twice = unchecked(data.time - lastUpTime) <= Native.GetDoubleClickTime()
+                        bool eligible = SelectionSurface.AllowsSelection(downSurface, surface);
+                        bool twice = eligible && lastUpTime != 0 && unchecked(data.time - lastUpTime) <= Native.GetDoubleClickTime()
                             && Math.Abs(data.pt.x - previousUp.x) <= Native.GetSystemMetrics(36)
                             && Math.Abs(data.pt.y - previousUp.y) <= Native.GetSystemMetrics(37);
                         previousUp = data.pt;
-                        lastUpTime = data.time;
+                        lastUpTime = eligible ? data.time : 0;
                         IntPtr window = capturedWindow;
-                        Trace("mouse-up drag=" + dragged + " double=" + twice + " same-window=" + (window == downWindow) + " same-app=" + Native.SameApp(window, downWindow) + " injected=" + ((data.flags & 1) != 0));
-                        if (settings.Enabled && (dragged || twice) && (window == downWindow || Native.SameApp(window, downWindow)) && !bubble.Contains(data.pt))
+                        Trace("mouse-up eligible=" + eligible + " drag=" + dragged + " double=" + twice + " same-window=" + (window == downWindow) + " same-app=" + Native.SameApp(window, downWindow) + " injected=" + ((data.flags & 1) != 0));
+                        if (settings.Enabled && eligible && (dragged || twice) && (window == downWindow || Native.SameApp(window, downWindow)) && !bubble.Contains(data.pt))
                         {
                             var point = data.pt;
+                            var origin = downSurface;
                             int queuedVersion = generation;
-                            app.Dispatcher.BeginInvoke(new Action(delegate { if (queuedVersion == generation) BeginSelection(window, point); }));
+                            app.Dispatcher.BeginInvoke(new Action(delegate { if (queuedVersion == generation) BeginSelection(window, point, origin); }));
                         }
                     }
                     else if (message == 0x20A || message == 0x20E || message == 0x204 || message == 0x207)
@@ -302,6 +302,8 @@ namespace LightTranslate
                 if (data.extra != Native.OwnInputMarker)
                 {
                     if (message == 0x100 || message == 0x104) Dismiss(false);
+                    if ((message == 0x100 || message == 0x104) && data.vkCode == 0x1B)
+                    { down = false; lastUpTime = 0; } // Escape cancels an in-progress drag.
                     if ((message == 0x101 || message == 0x105) && (data.vkCode == 0xA0 || data.vkCode == 0xA1) && settings.Enabled)
                     {
                         Native.POINT point;
@@ -322,7 +324,7 @@ namespace LightTranslate
             lifetime.Reset();
         }
 
-        private async void BeginSelection(IntPtr window, Native.POINT point)
+        private async void BeginSelection(IntPtr window, Native.POINT point, SelectionSurface origin = null)
         {
             selections++;
             Dismiss(true);
@@ -343,11 +345,11 @@ namespace LightTranslate
             {
                 await Task.Delay(25, ct);
                 if (!Valid(version, window)) return;
-                // Capture through the clipboard without UIAutomationClient handles.
-                // Native UIA pattern finalizers caused an access violation during testing.
+                // Inspect text context in the isolated helper before any clipboard access.
+                // The main process never owns UIAutomationClient objects.
                 if (!settings.ClipboardFallback || SelectionReader.IsTerminal(processName)) return;
-                string text = await SelectionReader.CopySelection(window, ct, Trace);
-                Trace("clipboard chars=" + (text == null ? 0 : text.Length));
+                string text = await SelectionReader.CopySelection(window, ct, Trace, point, origin);
+                Trace("selection chars=" + (text == null ? 0 : text.Length));
                 if (!Valid(version, window) || string.IsNullOrWhiteSpace(text)) { Trace("selection discarded valid=" + Valid(version, window)); return; }
                 text = text.Trim();
                 if (!SelectionReader.ShouldTranslate(text, settings.MinEnglishPercent)) { Trace("selection language threshold skipped"); return; }
@@ -358,13 +360,15 @@ namespace LightTranslate
                     ShowText("选中文字较长，请分段选择", point, 5);
                     return;
                 }
-                string translated = lexicon.Lookup(text);
-                if (translated != null || translator.TryCached(text, settings.Target, out translated))
+                string provider = Translator.NormalizeProvider(settings.TranslationProvider);
+                string target = settings.Target;
+                string translated = provider == "auto" ? lexicon.Lookup(text) : null;
+                if (translated != null || translator.TryCached(text, target, out translated, provider))
                 {
                     ShowText(translated, point, ReadingSeconds(translated), true);
                     return;
                 }
-                var request = translator.Translate(text, settings.Target, ct);
+                var request = translator.Translate(text, target, ct, provider);
                 if (await Task.WhenAny(request, Task.Delay(220, ct)) != request && Valid(version, window))
                     ShowText("…", point, 8);
                 translated = await request;
@@ -375,7 +379,12 @@ namespace LightTranslate
             catch (Exception ex)
             {
                 Program.Log("translate", ex.GetType().Name);
-                if (Valid(version, window)) ShowText("暂时无法连接翻译服务", point, 3);
+                bool explained = ex is DeepLException || ex is SelectionUnavailableException;
+                if (Valid(version, window))
+                {
+                    anchor = point; sourceWindow = window;
+                    ShowText(explained ? ex.Message : "暂时无法连接翻译服务", point, explained ? 6 : 3);
+                }
             }
             finally
             {
@@ -453,7 +462,7 @@ namespace LightTranslate
     {
         private const uint ProbeMessage = 0x84c0, DropTestMessage = 0x84c1;
         private readonly Dispatcher dispatcher;
-        private readonly Action<int, Native.MOUSE, IntPtr> onMouse;
+        private readonly Action<int, Native.MOUSE, IntPtr, SelectionSurface> onMouse;
         private readonly Action<int, Native.KEYBOARD, IntPtr> onKeyboard;
         private readonly Native.Hook mouseCallback, keyboardCallback;
         private readonly Thread thread;
@@ -476,7 +485,7 @@ namespace LightTranslate
         public int InstallationVersion { get { return Interlocked.CompareExchange(ref installationVersion, 0, 0); } }
         internal int Probes { get { return Interlocked.CompareExchange(ref probes, 0, 0); } }
 
-        public InputHooks(Dispatcher dispatcher, Action<int, Native.MOUSE, IntPtr> onMouse,
+        public InputHooks(Dispatcher dispatcher, Action<int, Native.MOUSE, IntPtr, SelectionSurface> onMouse,
             Action<int, Native.KEYBOARD, IntPtr> onKeyboard, bool testMode = false)
         {
             this.dispatcher = dispatcher;
@@ -518,7 +527,7 @@ namespace LightTranslate
                     else if (message.message == ProbeMessage && testMode)
                     {
                         Interlocked.Increment(ref probes);
-                        Queue(delegate { onMouse(0, new Native.MOUSE(), IntPtr.Zero); });
+                        Queue(delegate { onMouse(0, new Native.MOUSE(), IntPtr.Zero, null); });
                     }
                     else if (message.message == DropTestMessage && testMode) RemoveHooks();
                 }
@@ -556,7 +565,8 @@ namespace LightTranslate
                         if (forward)
                         {
                             IntPtr window = Native.GetForegroundWindow();
-                            Queue(delegate { onMouse(message, data, window); });
+                            SelectionSurface surface = (message == 0x201 || message == 0x202) ? SelectionSurface.Capture(data.pt) : null;
+                            Queue(delegate { onMouse(message, data, window, surface); });
                         }
                     }
                 }
@@ -689,69 +699,19 @@ namespace LightTranslate
             }
             return english > 0 && english * 100L >= letters * (long)minimumPercent;
         }
-        public static async Task<string> CopySelection(IntPtr window, CancellationToken ct, Action<string> trace)
+        public static async Task<string> CopySelection(IntPtr window, CancellationToken ct, Action<string> trace, Native.POINT? point = null, SelectionSurface origin = null)
         {
             if (Native.GetForegroundWindow() != window || Native.ModifierDown()) { trace("copy skipped focus/modifier"); return null; }
             if (Native.IsPasswordFocus(window)) { trace("password field skipped"); return null; }
-            uint before = Native.GetClipboardSequenceNumber(), copied = before;
-            Forms.DataObject saved;
-            try { saved = Snapshot(Forms.Clipboard.GetDataObject()); }
-            catch (Exception ex) { trace("clipboard snapshot " + ex.GetType().Name); return null; }
-            if (Native.GetClipboardSequenceNumber() != before) return null;
-            string result = null;
-            try
-            {
-                if (Native.GetForegroundWindow() != window || ct.IsCancellationRequested) return null;
-                Native.Copy();
-                for (int i = 0; i < 12; i++)
+            Func<bool> valid = delegate { return !ct.IsCancellationRequested && Native.GetForegroundWindow() == window && !Native.ModifierDown(); };
+            return await SelectionAcquisition.Read(
+                delegate { return IsolatedSelectionReader.ReadResult(window, ct, point: point, origin: origin); },
+                async delegate(SelectionReadResult result)
                 {
-                    await Task.Delay(15);
-                    uint sequence = Native.GetClipboardSequenceNumber();
-                    if (sequence != before)
-                    {
-                        bool owned = Native.SameApp(Native.GetClipboardOwner(), window);
-                        trace("copy changed owner-same-app=" + owned + " canceled=" + ct.IsCancellationRequested);
-                        if (!ct.IsCancellationRequested && Native.GetForegroundWindow() == window && owned)
-                        {
-                            copied = sequence;
-                            if (Forms.Clipboard.ContainsText()) result = Forms.Clipboard.GetText();
-                        }
-                        break;
-                    }
-                    if (ct.IsCancellationRequested) break;
-                }
-                return ct.IsCancellationRequested ? null : result;
-            }
-            catch { return null; }
-            finally
-            {
-                // Do not overwrite a newer clipboard created by the user or another app.
-                if (copied != before)
-                {
-                    for (int i = 0; i < 3; i++)
-                    {
-                        if (Native.GetClipboardSequenceNumber() != copied) break;
-                        try { Forms.Clipboard.SetDataObject(saved, true); break; }
-                        catch { Thread.Sleep(10); }
-                    }
-                }
-            }
-        }
-        internal static Forms.DataObject Snapshot(Forms.IDataObject source)
-        {
-            var copy = new Forms.DataObject();
-            if (source == null) return copy;
-            foreach (string format in source.GetFormats(false))
-            {
-                var value = source.GetData(format, false);
-                var stream = value as MemoryStream;
-                var image = value as System.Drawing.Image;
-                if (stream != null) value = new MemoryStream(stream.ToArray());
-                else if (image != null) value = image.Clone();
-                else if (value is string[]) value = ((string[])value).Clone();
-                if (value != null) copy.SetData(format, false, value);
-            }
-            return copy;
+                    using (var clipboard = new NativeSelectionClipboard())
+                        return await ClipboardCapture.Read(clipboard, window, valid, Native.Copy, trace,
+                            delegate { return Task.Delay(15); }, delegate { return Task.FromResult(result.ForCapture()); });
+                }, valid);
         }
     }
 
@@ -970,12 +930,16 @@ namespace LightTranslate
     internal sealed class Translator : IDisposable
     {
         private readonly HttpClient http;
+        private readonly DeepLTranslator deepl;
         private readonly JavaScriptSerializer json = new JavaScriptSerializer();
         private readonly Dictionary<string, string> cache = new Dictionary<string, string>();
         private readonly Queue<string> eviction = new Queue<string>();
-        public Translator()
+        public Translator() : this(null) { }
+        internal Translator(HttpMessageHandler handler, IDeepLCredentials credentials = null, HttpMessageHandler deepLHandler = null)
         {
-            http = new HttpClient { Timeout = TimeSpan.FromSeconds(7) };
+            deepl = new DeepLTranslator(credentials ?? DeepLCredentials.Current(), deepLHandler);
+            http = handler == null ? new HttpClient() : new HttpClient(handler);
+            http.Timeout = TimeSpan.FromSeconds(7);
             http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
             http.DefaultRequestHeaders.ExpectContinue = false;
         }
@@ -988,20 +952,37 @@ namespace LightTranslate
             }
             catch { }
         }
-        public bool TryCached(string text, string target, out string result) { return cache.TryGetValue(target + "\n" + text, out result); }
-        public async Task<string> Translate(string text, string target, CancellationToken ct)
+        internal static string NormalizeProvider(string provider)
+        { return provider == "microsoft" || provider == "tencent" || provider == "deepl" ? provider : "auto"; }
+        private static string CacheKey(string text, string target, string provider)
+        { return NormalizeProvider(provider) + "\n" + (provider == "tencent" ? "zh" : target) + "\n" + text; }
+        public bool TryCached(string text, string target, out string result, string provider = "auto")
         {
+            // DeepL validates the current credential before consulting its separate cache.
+            if (provider == "deepl") { result = null; return false; }
+            return cache.TryGetValue(CacheKey(text, target, provider), out result);
+        }
+        public async Task<string> Translate(string text, string target, CancellationToken ct, string provider = "auto")
+        {
+            ct.ThrowIfCancellationRequested();
+            provider = NormalizeProvider(provider);
+            if (provider == "deepl") return await deepl.Translate(text, target, ct);
             string result;
-            if (TryCached(text, target, out result)) return result;
-            bool fallback = false;
-            result = null;
-            try { result = await Microsoft(text, target, ct); }
-            catch (OperationCanceledException) { if (ct.IsCancellationRequested) throw; fallback = true; }
-            catch { ct.ThrowIfCancellationRequested(); fallback = true; }
-            if (fallback) result = await Tencent(text, ct);
+            if (TryCached(text, target, out result, provider)) return result;
+            if (provider == "tencent") result = await Tencent(text, ct);
+            else if (provider == "microsoft") result = await Microsoft(text, target, ct);
+            else
+            {
+                bool fallback = false;
+                result = null;
+                try { result = await Microsoft(text, target, ct); }
+                catch (OperationCanceledException) { if (ct.IsCancellationRequested) throw; fallback = true; }
+                catch { ct.ThrowIfCancellationRequested(); fallback = true; }
+                if (fallback) result = await Tencent(text, ct);
+            }
             if (string.IsNullOrWhiteSpace(result)) throw new InvalidDataException("Empty translation");
             ct.ThrowIfCancellationRequested();
-            string key = target + "\n" + text;
+            string key = CacheKey(text, target, provider);
             if (!cache.ContainsKey(key))
             {
                 if (cache.Count >= 256) cache.Remove(eviction.Dequeue());
@@ -1057,7 +1038,7 @@ namespace LightTranslate
             using (var hmac = new HMACSHA256(key))
                 return "MSTranslatorAndroidApp::" + Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(value))) + "::" + date + "::" + guid;
         }
-        public void Dispose() { http.Dispose(); }
+        public void Dispose() { http.Dispose(); deepl.Dispose(); }
     }
 
     internal static class Native
@@ -1188,17 +1169,14 @@ namespace LightTranslate
                 results["dictionaryLookupMs"] = sw.Elapsed.TotalMilliseconds;
                 results["dictionaryText"] = word;
             }
-            var original = new Forms.DataObject();
-            original.SetData(Forms.DataFormats.UnicodeText, false, "original clipboard");
-            original.SetData(Forms.DataFormats.Html, false, "<b>original</b>");
-            var snapshot = SelectionReader.Snapshot(original);
-            if ((string)snapshot.GetData(Forms.DataFormats.UnicodeText) != "original clipboard" || (string)snapshot.GetData(Forms.DataFormats.Html) != "<b>original</b>") throw new Exception("Clipboard snapshot failed");
+            ClipboardCaptureTests.Run(results);
             if (!SelectionReader.IsTerminal("pwsh") || SelectionReader.IsTerminal("Codex")) throw new Exception("Terminal guard failed");
             if (SelectionReader.HasForeignText("这是中文") || !SelectionReader.HasForeignText("Read this text")) throw new Exception("Language guard failed");
-            results["clipboardSnapshot"] = "text + HTML preserved";
             results["guards"] = "terminal + language passed";
+            TrayIconRenderer.Test(results);
             ReadingSettingsTests.Run(results);
             UnifiedSettingsTests.Run(results);
+            TranslationProviderTests.Run(results);
             Program.Log("self-test", "dictionary and clipboard snapshot passed");
             if (System.Reflection.Assembly.GetExecutingAssembly().GetReferencedAssemblies().Any(a => a.Name == "UIAutomationClient"))
                 throw new Exception("Unsafe UIA client dependency remains");
@@ -1209,7 +1187,6 @@ namespace LightTranslate
             }
             results["capture"] = "clipboard only; no UIAutomationClient dependency";
             results["passwordGuard"] = "native password/plain controls passed";
-            for (int i = 0; i < 100; i++) SelectionReader.Snapshot(original);
             Program.Log("self-test", "password guard passed; collecting objects");
             // OLE finalizers can marshal back to the STA: pump while awaiting them.
             var finalizers = Task.Run(delegate { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); });
@@ -1225,7 +1202,7 @@ namespace LightTranslate
             int forwarded = 0;
             var dispatcher = Dispatcher.CurrentDispatcher;
             using (var hooks = new InputHooks(dispatcher,
-                delegate(int message, Native.MOUSE data, IntPtr window) { if (message == 0) forwarded++; },
+                delegate(int message, Native.MOUSE data, IntPtr window, SelectionSurface surface) { if (message == 0) forwarded++; },
                 delegate(int message, Native.KEYBOARD data, IntPtr window) { }, true))
             {
                 // Keep the WPF/clipboard STA blocked while probing the real input thread.
@@ -1287,8 +1264,7 @@ namespace LightTranslate
             if ((Native.GetWindowLong(handle, -20) & 0x08000000) == 0) throw new Exception("No-activation style missing");
             results["noActivation"] = "window style verified";
             bubble.RenderPreview(Path.Combine(Program.Folder, "preview.png"));
-            using (var icon = Controller.MakeIcon())
-            using (var file = File.Create(Path.Combine(Program.Folder, "LightTranslate.ico"))) icon.Save(file);
+            File.WriteAllBytes(Path.Combine(Program.Folder, "LightTranslate.ico"), TrayIconRenderer.Encode(new Settings()));
             results["bubblePreview"] = "rendered";
             File.WriteAllText(Path.Combine(Program.Folder, "self-test.json"), new JavaScriptSerializer().Serialize(results), Encoding.UTF8);
             Program.Log("self-test", "passed");
