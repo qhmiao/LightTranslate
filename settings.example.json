@@ -1,6 +1,7 @@
 {
   "Enabled": true,
   "ClipboardFallback": true,
+  "AllowClipboardOverwrite": false,
   "Target": "zh-Hans",
   "TranslationProvider": "auto",
   "IndexModel": "Index-Translate-35B-A3B",

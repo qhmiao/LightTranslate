@@ -104,7 +104,9 @@ namespace LightTranslate
         private readonly PasswordBox deepLKey;
         private readonly TextBlock deepLStatus;
         private bool clearDeepLKey;
-        private readonly CheckBox enabled, clipboard, autoStart;
+        private readonly CheckBox enabled, clipboard, allowOverwrite, autoStart;
+        private readonly Func<bool> confirmOverwrite;
+        private bool fillingOverwrite;
         private readonly ComboBox language, provider, indexModel, fontFamily, fontSize, autoHide;
         private readonly TextBox maxSelection, excludedApps, background, englishPercent;
         private readonly TextBlock error, previewText, startupStatus;
@@ -114,9 +116,11 @@ namespace LightTranslate
         private bool refreshingStartup, startupDirty;
         private bool? observedStartup;
 
-        internal SettingsWindow(Settings settings, Action saved, IStartupRegistration startup = null, IDeepLCredentials credentials = null)
+        internal SettingsWindow(Settings settings, Action saved, IStartupRegistration startup = null, IDeepLCredentials credentials = null,
+            Func<bool> confirmOverwrite = null)
         {
             this.settings = settings; this.saved = saved;
+            this.confirmOverwrite = confirmOverwrite ?? delegate { return new ClipboardOverwriteConfirmation(this).ShowDialog() == true; };
             this.startup = startup ?? StartupRegistration.CurrentUser();
             this.credentials = credentials ?? DeepLCredentials.Current();
             Title = "轻译 · 设置";
@@ -141,7 +145,18 @@ namespace LightTranslate
             enabled = Toggle("自动划词翻译");
             clipboard = Toggle("启用选区取词");
             translation.Children.Add(enabled); translation.Children.Add(clipboard);
-            translation.Children.Add(Help("托盘开关立即生效；面板修改在保存后生效。关闭取词后停止划词翻译。通常临时复制选区并恢复剪贴板；若含图片或专用数据，则尝试隔离读取选区，不改剪贴板。无法安全读取时会提示。"));
+            translation.Children.Add(Help("托盘开关立即生效；面板修改在保存后生效。关闭取词后停止划词翻译。先尝试隔离读取选区；需要临时复制时，能完整备份则恢复原剪贴板。无法备份时按下方覆盖选项处理。"));
+            allowOverwrite = Toggle("取词优先，允许覆盖（默认关闭）");
+            translation.Children.Add(allowOverwrite);
+            translation.Children.Add(Help("仅在无法完整备份时允许覆盖原剪贴板。" + ClipboardBackupException.Risk + "关闭时，可在失败提示中单次选择“本次覆盖并取词”。"));
+            AutomationProperties.SetHelpText(allowOverwrite, ClipboardBackupException.Risk);
+            allowOverwrite.Checked += delegate {
+                if (fillingOverwrite) return;
+                bool approved = false;
+                try { approved = this.confirmOverwrite(); }
+                catch { if (error != null) Invalid("无法完成覆盖风险确认，选项保持关闭。", allowOverwrite, 0); }
+                if (!approved) allowOverwrite.IsChecked = false;
+            };
             provider = new ComboBox { ItemsSource = new[] { "自动（微软失败后腾讯）", "仅微软", "仅腾讯（中文）", "仅 DeepL（自备 API 密钥）", "仅哔哩哔哩 Index" }, MinHeight = 32 };
             AddField(translation, "在线翻译服务", provider);
             translation.Children.Add(Help("自动模式先查本地英汉词库，再尝试微软、腾讯；指定服务会跳过词库且不自动切换。DeepL 须在 DeepL 页保存密钥；自动模式不会调用 DeepL。"));
@@ -272,6 +287,9 @@ namespace LightTranslate
         {
             if (error != null) error.Visibility = Visibility.Collapsed;
             enabled.IsChecked = value.Enabled; clipboard.IsChecked = value.ClipboardFallback;
+            fillingOverwrite = true;
+            try { allowOverwrite.IsChecked = value.AllowClipboardOverwrite; }
+            finally { fillingOverwrite = false; }
             provider.SelectedIndex = value.TranslationProvider == "microsoft" ? 1 : value.TranslationProvider == "tencent" ? 2 : value.TranslationProvider == "deepl" ? 3 : value.TranslationProvider == "index" ? 4 : 0;
             indexModel.SelectedItem = value.IndexModel;
             indexModel.IsEnabled = provider.SelectedIndex == 4;
@@ -345,6 +363,7 @@ namespace LightTranslate
                 return Invalid("最低英文占比请输入 0–100 的整数百分比。", englishPercent, 0);
             var next = settings.Clone();
             next.Enabled = enabled.IsChecked == true; next.ClipboardFallback = clipboard.IsChecked == true;
+            next.AllowClipboardOverwrite = allowOverwrite.IsChecked == true;
             next.TranslationProvider = provider.SelectedIndex == 1 ? "microsoft" : provider.SelectedIndex == 2 ? "tencent" : provider.SelectedIndex == 3 ? "deepl" : provider.SelectedIndex == 4 ? "index" : "auto";
             if (provider.SelectedIndex == 4 && !IndexTranslator.ValidModel(indexModel.SelectedItem as string))
                 return Invalid("请选择 Index 模型：2B、9B 或 35B。", indexModel, 0);
@@ -449,6 +468,8 @@ namespace LightTranslate
         internal string IndexModelForTest { get { return indexModel.SelectedItem as string; } }
         internal bool IndexModelEnabledForTest { get { return indexModel.IsEnabled; } }
         internal bool TargetEnabledForTest { get { return language.IsEnabled; } }
+        internal void SetOverwriteForTest(bool value) { allowOverwrite.IsChecked = value; }
+        internal bool OverwriteForTest { get { return allowOverwrite.IsChecked == true; } }
         internal void SetStartupForTest(bool value) { autoStart.IsChecked = value; }
         internal bool EnabledForTest { get { return enabled.IsChecked == true; } }
         internal bool? StartupForTest { get { return autoStart.IsChecked; } }

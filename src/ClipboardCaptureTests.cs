@@ -60,8 +60,7 @@ namespace LightTranslate
             var canceled = new Fake(); canceled.OnSnapshot = delegate { canceled.Valid = false; };
             Check(canceled.Run(tick).Result == null && canceled.Copies == 0, "canceled snapshot never copies");
             var userCopy = new Fake(); userCopy.OnRestore = delegate { userCopy.Version++; };
-            userCopy.Run(tick).GetAwaiter().GetResult();
-            Check(userCopy.Restores == 0, "newer clipboard is not overwritten");
+            Check(userCopy.Run(tick).GetAwaiter().GetResult() == null && userCopy.Restores == 0, "newer clipboard is not overwritten and stale capture is discarded");
             var cancelAfter = new Fake(); cancelAfter.OnRead = delegate { cancelAfter.Valid = false; };
             Check(cancelAfter.Run(tick).Result == null && cancelAfter.Restores == 0, "cancellation before restore preserves clipboard");
             var wrongOwner = new Fake { ReadWorks = false };

@@ -30,7 +30,8 @@ namespace LightTranslate
         private static readonly SemaphoreSlim gate = new SemaphoreSlim(1, 1);
 
         internal static async Task<string> Read(ISelectionClipboard clipboard, IntPtr source,
-            Func<bool> valid, Action copy, Action<string> trace, Func<Task> wait, Func<Task<string>> withoutClipboard = null)
+            Func<bool> valid, Action copy, Action<string> trace, Func<Task> wait, Func<Task<string>> withoutClipboard = null,
+            ClipboardCapturePolicy policy = null)
         {
             // Do not queue stale selections or snapshot another capture's temporary clipboard.
             if (!gate.Wait(0)) { trace("copy skipped busy"); return null; }
@@ -38,14 +39,31 @@ namespace LightTranslate
             {
                 ClipboardSnapshot saved;
                 if (!valid()) return null;
+                uint initial = clipboard.Sequence;
+                if (policy != null && policy.RequiredSequence.HasValue && policy.RequiredSequence.Value != initial)
+                    throw new ClipboardBackupException(ClipboardBackupFailure.Changed, initial);
                 if (!clipboard.TrySnapshot(out saved))
                 {
                     trace("clipboard snapshot skipped");
+                    if (!valid()) return null;
+                    if (policy != null)
+                    {
+                        var diagnostics = clipboard as IClipboardBackupDiagnostics;
+                        var reason = diagnostics == null ? ClipboardBackupFailure.Unreadable : diagnostics.BackupFailure;
+                        uint current = clipboard.Sequence;
+                        if (initial == 0 || current != initial) reason = ClipboardBackupFailure.Changed;
+                        trace("clipboard backup reason=" + reason);
+                        if (policy.AllowOverwrite && ClipboardBackupException.MayOverwrite(reason))
+                            return await ReadWithoutRestore(clipboard, source, current, valid, copy, trace, wait);
+                        throw new ClipboardBackupException(reason, current);
+                    }
                     if (withoutClipboard == null || !valid()) return null;
                     string selected = await withoutClipboard();
                     return valid() ? selected : null;
                 }
                 if (!valid() || clipboard.Sequence != saved.Sequence) return null;
+                if (policy != null && policy.RequiredSequence.HasValue && saved.Sequence != policy.RequiredSequence.Value)
+                    throw new ClipboardBackupException(ClipboardBackupFailure.Changed, clipboard.Sequence);
                 copy();
                 for (int i = 0; i < 12; i++)
                 {
@@ -62,6 +80,7 @@ namespace LightTranslate
                         var result = clipboard.Restore(saved, copied, valid);
                         if (result != RestoreResult.Busy)
                         {
+                            if (result == RestoreResult.Changed) { trace("clipboard changed before restore; result discarded"); return null; }
                             if (result == RestoreResult.Failed) trace("clipboard restore failed");
                             return valid() ? text : null;
                         }
@@ -74,17 +93,47 @@ namespace LightTranslate
             }
             finally { gate.Release(); }
         }
+
+        private static async Task<string> ReadWithoutRestore(ISelectionClipboard clipboard, IntPtr source, uint before,
+            Func<bool> valid, Action copy, Action<string> trace, Func<Task> wait)
+        {
+            if (!valid()) return null;
+            if (before == 0 || clipboard.Sequence != before)
+                throw new ClipboardBackupException(ClipboardBackupFailure.Changed, clipboard.Sequence);
+            // Do not clear the clipboard first. A failed Ctrl+C must never return the old data.
+            // This path has no backup and must never call Restore, even after cancellation.
+            trace("clipboard overwrite authorized");
+            try { copy(); }
+            catch (OperationCanceledException) { throw; }
+            catch { if (!valid()) return null; throw new SelectionUnavailableException("未能向源应用发送本次复制，未读取旧剪贴板。原剪贴板可能已改变。"); }
+            for (int i = 0; i < 32; i++)
+            {
+                await wait();
+                if (!valid()) return null;
+                uint observed = clipboard.Sequence;
+                if (observed == before) continue;
+                uint copied; string text;
+                if (!clipboard.TryReadText(source, observed, out copied, out text) || copied != observed || clipboard.Sequence != copied)
+                    throw new SelectionUnavailableException("剪贴板已变化或复制来源无法确认，已取消本次取词；未翻译旧内容。");
+                if (!valid()) return null;
+                if (string.IsNullOrWhiteSpace(text))
+                    throw new SelectionUnavailableException("这次复制没有产生可读取的新文字，未翻译旧内容。原剪贴板可能已改变。");
+                return text;
+            }
+            throw new SelectionUnavailableException("这次复制超时，没有收到可验证的新文字；未翻译旧内容。原剪贴板可能已改变。");
+        }
     }
 
     // Read only documented HGLOBAL text formats. Never materialize IDataObject/OLE objects.
     // Unknown formats reject the entire snapshot before Ctrl+C, rather than losing rich data.
-    internal sealed class NativeSelectionClipboard : ISelectionClipboard, IDisposable
+    internal sealed class NativeSelectionClipboard : ISelectionClipboard, IClipboardBackupDiagnostics, IDisposable
     {
         internal const int MaxFormatBytes = 8 * 1024 * 1024;
         private const int MaxSnapshotBytes = 16 * 1024 * 1024;
         private readonly Forms.NativeWindow window = new Forms.NativeWindow();
         internal IntPtr Handle { get { return window.Handle; } }
         public uint Sequence { get { return Native.GetClipboardSequenceNumber(); } }
+        public ClipboardBackupFailure BackupFailure { get; private set; }
 
         internal NativeSelectionClipboard()
         {
@@ -102,52 +151,65 @@ namespace LightTranslate
         }
 
         internal static bool TryFormats(out List<uint> formats)
+        { ClipboardBackupFailure reason; return TryFormats(out formats, out reason); }
+        private static bool TryFormats(out List<uint> formats, out ClipboardBackupFailure reason)
         {
+            reason = ClipboardBackupFailure.None;
             formats = new List<uint>();
             uint format = 0;
             while (true)
             {
                 ClipboardNative.SetLastError(0);
                 format = ClipboardNative.EnumClipboardFormats(format);
-                if (format == 0) return Marshal.GetLastWin32Error() == 0;
-                if (formats.Count >= 64 || !Supported(format) || formats.Contains(format)) return false;
+                if (format == 0) { if (Marshal.GetLastWin32Error() != 0) { reason = ClipboardBackupFailure.Unreadable; return false; } return true; }
+                if (formats.Count >= 64) { reason = ClipboardBackupFailure.TooLarge; return false; }
+                if (!Supported(format)) { reason = ClipboardBackupFailure.UnsupportedFormat; return false; }
+                if (formats.Contains(format)) { reason = ClipboardBackupFailure.Unreadable; return false; }
                 formats.Add(format);
             }
         }
 
         internal static bool TryBytes(uint format, out byte[] bytes)
+        { ClipboardBackupFailure reason; return TryBytes(format, out bytes, out reason); }
+        private static bool TryBytes(uint format, out byte[] bytes, out ClipboardBackupFailure reason)
         {
+            reason = ClipboardBackupFailure.Unreadable;
             bytes = null;
             IntPtr handle = ClipboardNative.GetClipboardData(format);
             if (handle == IntPtr.Zero) return false;
             ulong size = ClipboardNative.GlobalSize(handle).ToUInt64();
-            if (size == 0 || size > MaxFormatBytes) return false;
+            if (size > MaxFormatBytes) { reason = ClipboardBackupFailure.TooLarge; return false; }
+            if (size == 0) return false;
             IntPtr pointer = ClipboardNative.GlobalLock(handle);
             if (pointer == IntPtr.Zero) return false;
-            try { bytes = new byte[(int)size]; Marshal.Copy(pointer, bytes, 0, bytes.Length); return true; }
+            try { bytes = new byte[(int)size]; Marshal.Copy(pointer, bytes, 0, bytes.Length); reason = ClipboardBackupFailure.None; return true; }
             finally { ClipboardNative.GlobalUnlock(handle); }
         }
 
         public bool TrySnapshot(out ClipboardSnapshot snapshot)
         {
             snapshot = null;
-            if (!ClipboardNative.OpenClipboard(Handle)) return false;
+            BackupFailure = ClipboardBackupFailure.None;
+            if (!ClipboardNative.OpenClipboard(Handle)) { BackupFailure = ClipboardBackupFailure.Busy; return false; }
             try
             {
                 var saved = new ClipboardSnapshot { Sequence = Sequence };
-                if (saved.Sequence == 0) return false;
+                if (saved.Sequence == 0) { BackupFailure = ClipboardBackupFailure.Changed; return false; }
                 List<uint> formats;
-                if (!TryFormats(out formats)) return false;
+                ClipboardBackupFailure reason;
+                if (!TryFormats(out formats, out reason)) { BackupFailure = reason; return false; }
                 int total = 0;
                 foreach (uint format in formats)
                 {
                     byte[] bytes;
-                    if (!TryBytes(format, out bytes) || (total += bytes.Length) > MaxSnapshotBytes) return false;
+                    if (!TryBytes(format, out bytes, out reason)) { BackupFailure = reason; return false; }
+                    if ((total += bytes.Length) > MaxSnapshotBytes) { BackupFailure = ClipboardBackupFailure.TooLarge; return false; }
                     saved.Formats.Add(new KeyValuePair<uint, byte[]>(format, bytes));
                 }
                 // Rendering a delayed format may change the sequence or advertise more formats.
                 List<uint> after;
-                if (saved.Sequence != Sequence || !TryFormats(out after) || !formats.SequenceEqual(after)) return false;
+                if (saved.Sequence != Sequence || !TryFormats(out after, out reason) || !formats.SequenceEqual(after))
+                { BackupFailure = ClipboardBackupFailure.Changed; return false; }
                 snapshot = saved;
                 return true;
             }

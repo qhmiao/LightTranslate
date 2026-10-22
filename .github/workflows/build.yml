@@ -20,6 +20,9 @@ jobs:
       - name: Clipboard workflow regression
         shell: pwsh
         run: ./scripts/test-clipboard.ps1
+      - name: Clipboard overwrite consent and race regression
+        shell: pwsh
+        run: ./scripts/test-overwrite.ps1
       - name: Native window gesture boundaries
         shell: pwsh
         run: ./scripts/test-gestures.ps1

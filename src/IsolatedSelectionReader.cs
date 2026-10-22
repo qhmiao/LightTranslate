@@ -9,7 +9,7 @@ using System.Threading.Tasks;
 
 namespace LightTranslate
 {
-    internal sealed class SelectionUnavailableException : Exception
+    internal class SelectionUnavailableException : Exception
     {
         internal SelectionUnavailableException(string message = "当前应用暂时无法读取选区，已保留剪贴板原内容。") : base(message) { }
     }

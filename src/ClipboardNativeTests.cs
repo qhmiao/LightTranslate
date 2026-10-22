@@ -82,7 +82,7 @@ namespace LightTranslate
                 worker.Start(); worker.Join();
                 if (failure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
                 File.WriteAllText(Path.Combine(Program.Folder, "clipboard-native-test.json"),
-                    new JavaScriptSerializer().Serialize(new { isolation = "private window station", result = "passed", cases = "text, HTML/RTF, exact bytes, empty, unknown, oversized, busy, stale/canceled restore, delayed rendering" }));
+                    new JavaScriptSerializer().Serialize(new { isolation = "private window station", result = "passed", cases = "text, HTML/RTF, exact bytes, empty, unknown, oversized, busy, stale/canceled restore, delayed rendering", overwriteCases = "unsupported-format refusal without copy, explicit real edit-copy leaves fresh text, failed copy never reads stale text or clears clipboard; all on the private station" }));
                 return 0;
             }
             finally
@@ -132,13 +132,41 @@ namespace LightTranslate
                     Put(clipboard.Handle, Text("keep"), new KeyValuePair<uint, byte[]>(unknown, new byte[] { 1, 2, 3 }));
                     uint before = clipboard.Sequence;
                     Check(!clipboard.TrySnapshot(out restored) && clipboard.Sequence == before, "unknown mixed format skips without mutation");
+                    Check(clipboard.BackupFailure == ClipboardBackupFailure.UnsupportedFormat, "unsupported format failure classified");
+                    // Every destructive case below runs on this private window station's clipboard.
+                    using (var form = new Forms.Form())
+                    using (var edit = new Forms.TextBox { Text = "prefix reversible suffix" })
+                    {
+                        form.Controls.Add(edit); IntPtr root = form.Handle; edit.Select(7, 10);
+                        bool offered = false; int copies = 0;
+                        try {
+                            SelectionIntegrationTests.Pump(ClipboardCapture.Read(clipboard, root, delegate { return true; },
+                                delegate { copies++; edit.Copy(); }, delegate { }, delegate { return System.Threading.Tasks.Task.Delay(15); }, null,
+                                new ClipboardCapturePolicy()));
+                        }
+                        catch (ClipboardBackupException ex) { offered = ex.CanOffer; }
+                        Check(offered && copies == 0 && clipboard.Sequence == before, "default unsafe snapshot offers without changing private clipboard");
+                        string overwriteText = SelectionIntegrationTests.Pump(ClipboardCapture.Read(clipboard, root, delegate { return true; }, edit.Copy,
+                            delegate { }, delegate { return System.Threading.Tasks.Task.Delay(15); }, null,
+                            new ClipboardCapturePolicy { AllowOverwrite = true, RequiredSequence = before }));
+                        Check(overwriteText == "reversible" && !ClipboardNative.IsClipboardFormatAvailable(unknown), "explicit private clipboard overwrite captures fresh text and leaves new content");
+                        Put(clipboard.Handle, Text("old fixture must never be translated"), new KeyValuePair<uint, byte[]>(unknown, new byte[] { 1, 2, 3 }));
+                        uint failedBefore = clipboard.Sequence; bool timedOut = false;
+                        try {
+                            SelectionIntegrationTests.Pump(ClipboardCapture.Read(clipboard, root, delegate { return true; }, delegate { },
+                                delegate { }, delegate { return System.Threading.Tasks.Task.Delay(1); }, null,
+                                new ClipboardCapturePolicy { AllowOverwrite = true }));
+                        }
+                        catch (SelectionUnavailableException ex) { timedOut = ex.Message.Contains("超时"); }
+                        Check(timedOut && clipboard.Sequence == failedBefore, "failed copy never reads stale text or clears even private clipboard");
+                    }
                     Put(clipboard.Handle);
                     Check(clipboard.TrySnapshot(out original) && original.Formats.Count == 0, "empty clipboard snapshot");
                     Put(clipboard.Handle, Text("temporary"));
                     Check(clipboard.Restore(original, clipboard.Sequence, delegate { return true; }) == RestoreResult.Restored, "empty restore");
                     Check(clipboard.TrySnapshot(out restored) && restored.Formats.Count == 0, "empty preserved");
                     Put(clipboard.Handle, new KeyValuePair<uint, byte[]>(13, new byte[NativeSelectionClipboard.MaxFormatBytes + 2]));
-                    Check(!clipboard.TrySnapshot(out restored), "oversize snapshot rejected");
+                    Check(!clipboard.TrySnapshot(out restored) && clipboard.BackupFailure == ClipboardBackupFailure.TooLarge, "oversize snapshot rejected with reason");
                     Put(clipboard.Handle, Text("busy"));
                     using (var opened = new ManualResetEvent(false))
                     using (var release = new ManualResetEvent(false))
